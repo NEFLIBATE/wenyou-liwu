@@ -76,9 +76,3 @@ v1.0.1 增加针对窄屏、横屏、主题覆盖、背景点击、关闭重开�
 
 - SillyTavern Git扩展安装：https://docs.sillytavern.app/extensions/
 - GitHub网页上传文件：https://docs.github.com/en/repositories/working-with-files/managing-files/adding-a-file-to-a-repository
-
-## 开发与检查
-
-`app.html` 是自包含页面的源文件；修改后运行 `node scripts/build-app.mjs` 同步生成 `app-content.js`，两者必须一起提交。
-
-浏览器回归检查：安装 Playwright 及 Chromium 后运行 `node tests/modal.cjs`。可用 `WENYOU_CHROMIUM_EXECUTABLE` 指定 Chromium 可执行文件。
