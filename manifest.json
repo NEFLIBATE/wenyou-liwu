@@ -1,11 +1,11 @@
 {
- "display_name": "文游工坊 · PDF/DOCX 资料生成器",
- "loading_order": 100,
- "requires": [],
- "optional": [],
- "js": "index.js",
- "css": "host.css",
- "author": "Wenyou Forge",
- "version": "1.0.0",
- "auto_update": false
+  "display_name": "文游工坊 · PDF/DOCX 资料生成器",
+  "loading_order": 100,
+  "requires": [],
+  "optional": [],
+  "js": "index.js",
+  "css": "host.css",
+  "author": "Wenyou Forge",
+  "version": "1.0.1",
+  "auto_update": false
 }

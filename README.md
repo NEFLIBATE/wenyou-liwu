@@ -1,20 +1,32 @@
-# 文游工坊 · 云酒馆 Git 安装版 v1.0
+# 文游工坊 · 云酒馆 Git 安装版 v1.0.1
 
 把 PDF、DOCX、TXT 等资料变成手机端互动文游。适用于带有「安装扩展 → 输入 Git URL」入口的 SillyTavern。
 
-## 这份包怎么用
+## 安装与更新
 
-这是一份可直接放到 Git 仓库根目录的扩展文件集，还没有被发布成可安装的 Git 仓库。ZIP 下载地址不是 Git URL。
+本仓库可直接通过 Git URL 安装：
 
-解压后有6个文件：`manifest.json`、`index.js`、`host.css`、`app.html`、`LICENSE`、`README.md`。把这6个文件上传到你自己新建的 GitHub 仓库根目录；不要只上传ZIP，不要再套一层文件夹。
+`https://github.com/NEFLIBATE/wenyou-liwu`
+
+已安装用户：在酒馆的扩展管理里更新「文游工坊」，然后完整刷新酒馆页面。仅关闭再打开工坊不会重新加载扩展代码。
+
+手机手动上传文件时，请保留仓库根目录的 `manifest.json`、`index.js`、`host.css`、`app.html`、`app-content.js`、`README.md`。不要只上传 ZIP，也不要再套一层目录。
+
+### v1.0.1 修复
+
+- 全屏窗口改用原生模态对话框；打开时背景酒馆无法点击或获得焦点，关闭或按 Escape 后恢复。
+- 对话框样式隔离在 Shadow DOM 中，内容区明确占满剩余屏幕，避免主题与缓存样式造成遮挡、透明或高度塌缩。
+- 通过 JavaScript 资源载入自包含页面并渲染到 iframe，避免云端把 HTML 文件请求转回酒馆首页；无需修改服务器设置或开放新权限。
+- 加入加载超时、错误提示和重试；加载成功以页面握手确认。
+- 修复中文打开按钮竖排，保留当前进度、资料解析、酒馆 AI 桥接及离线导出。
 
 ## 手机上传 GitHub
 
 1. 打开 https://github.com/new ，登录你自己的 GitHub 账号。
 2. 创建一个新的空仓库，例如 `wenyou-forge`。选择 Public（公开），以便云酒馆无需仓库凭据即可读取；包里是扩展代码，不要往仓库加入自己的资料或密钥。
 3. 在空仓库首页点击「uploading an existing file」。如果仓库已有文件，选择「Add file → Upload files」。
-4. 点击「choose your files」，在手机文件选择器内选中本包解压得到的6个文件，然后完成提交。
-5. 回到仓库首页，确认文件列表直接显示 `manifest.json`、`index.js` 和 `app.html`。
+4. 点击「choose your files」，在手机文件选择器内选中上文列出的文件，然后完成提交。
+5. 回到仓库首页，确认文件列表直接显示 `manifest.json`、`index.js`、`app.html` 和 `app-content.js`。
 6. 复制仓库首页地址（格式见下文），回云酒馆的安装扩展弹窗粘贴并安装。分支栏可留空，使用默认分支。
 
 仓库地址格式示意，必须替换成你实际建立的仓库：
@@ -54,7 +66,7 @@
 
 本扩展按近期官方SillyTavern的 `SillyTavern.getContext().generateRaw({...})` 接口开发，不依赖Extras或酒馆助手。云酒馆若使用旧版或修改版，仍需实际验证兼容性。
 
-交付前已验证文件解析、DOM功能、回合与存档，以及模拟酒馆接口；未在你的云酒馆、实际模型或安卓实体设备联调。本次仅调整Git仓库打包结构，不改变v1.0游戏逻辑。
+v1.0.1 增加针对窄屏、横屏、主题覆盖、背景点击、关闭重开、页面加载失败与重试的浏览器回归检查。实际云酒馆登录状态、实际模型及安卓实体设备仍需安装更新后验证。
 
 ## 源码与授权
 
@@ -64,3 +76,9 @@
 
 - SillyTavern Git扩展安装：https://docs.sillytavern.app/extensions/
 - GitHub网页上传文件：https://docs.github.com/en/repositories/working-with-files/managing-files/adding-a-file-to-a-repository
+
+## 开发与检查
+
+`app.html` 是自包含页面的源文件；修改后运行 `node scripts/build-app.mjs` 同步生成 `app-content.js`，两者必须一起提交。
+
+浏览器回归检查：安装 Playwright 及 Chromium 后运行 `node tests/modal.cjs`。可用 `WENYOU_CHROMIUM_EXECUTABLE` 指定 Chromium 可执行文件。

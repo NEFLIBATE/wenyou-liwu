@@ -1,2 +1,14 @@
-#wenyou-forge-launch{padding:14px;border:1px solid var(--SmartThemeBorderColor,#777);border-radius:10px;margin:10px 0}#wenyou-forge-overlay{position:fixed;inset:0;z-index:100000;display:flex;flex-direction:column;background:#edf1e9;padding-top:env(safe-area-inset-top)}#wenyou-forge-overlay[hidden]{display:none}#wenyou-forge-overlay .wenyou-hostbar{display:flex;align-items:center;justify-content:space-between;min-height:44px;padding:5px 15px;background:#fffef9;border-bottom:1px solid #dce5da;color:#253b39;font:14px system-ui}#wenyou-forge-overlay .wenyou-hostbar button{font:13px system-ui;background:#e9f1e9;border:1px solid #cfdaca;border-radius:9px;color:#253b39;padding:7px 12px;cursor:pointer}#wenyou-forge-overlay iframe{display:block;width:100%;flex:1;border:0;min-height:0;background:#edf1e9}
-#wenyou-forge-launch > button {width: fit-content;max-width: 100%;white-space: nowrap;}
+#wenyou-forge-launch {
+    padding: 14px;
+    border: 1px solid var(--SmartThemeBorderColor, #777);
+    border-radius: 10px;
+    margin: 10px 0;
+}
+
+#wenyou-forge-launch > button {
+    width: fit-content !important;
+    max-width: 100% !important;
+    white-space: nowrap !important;
+}
+
+/* Full-screen modal styles live in index.js inside a shadow root. */
