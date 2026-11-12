@@ -1,6 +1,6 @@
 /* 文游工坊 SillyTavern adapter · MIT */
 const EXT_URL = new URL('./', import.meta.url);
-const VERSION = '1.1.0';
+const VERSION = '1.2.0';
 let dialog, frame, bridgeToken, status, retry, closeButton;
 let ready = false, loading = false, inFlight = false, loadNumber = 0;
 let timer, templatePromise, previousFocus, scrollStyles;
@@ -193,6 +193,89 @@ async function loadApp() {
     }
 }
 
+// Only names/IDs cross into the game. Connection settings and preset secrets stay here.
+function getCatalog(context) {
+    const power = context?.powerUserSettings;
+    const manager = context?.getPresetManager?.();
+    return {
+        personas: power ? [{ id: '@current', name: `当前用户 · ${context.name1 || '未命名'}` },
+            ...Object.entries(power.personas || {}).map(([id, name]) => ({ id, name: String(name || id) }))] : [],
+        presets: manager?.getAllPresets?.() || [],
+        api: context?.mainApi || '', currentPreset: manager?.getSelectedPresetName?.() || '',
+        personaSupport: Boolean(power), presetSupport: Boolean(manager),
+    };
+}
+function readPersona(context, id) {
+    const power = context?.powerUserSettings;
+    if (!power) throw Error('此酒馆未提供用户人设接口，请更新酒馆或改用手动人设。');
+    if (id !== '@current' && !Object.hasOwn(power.personas || {}, id)) {
+        throw Error('该酒馆人设已删除，请刷新列表重新选择。');
+    }
+    const name = id === '@current' ? context.name1 : power.personas[id];
+    const description = id === '@current' ? power.persona_description : power.persona_descriptions?.[id]?.description;
+    if (String(description || '').length > 20000) throw Error('该人设超过 20,000 字符，请先在酒馆精简，或使用手动人设。');
+    return { id, name: String(name || '未命名'), description: String(description || '') };
+}
+async function usePreset(context, selected) {
+    if (!selected?.name) return context;
+    if (selected.api !== context.mainApi) throw Error('存档预设属于另一种 API。请在工坊或存档中重新选择预设。');
+    const manager = context.getPresetManager?.();
+    if (!manager?.getAllPresets?.().includes(selected.name)) throw Error('所选酒馆预设已不存在，请刷新列表重新选择。');
+    // This is an explicit native selection, not a temporary switch that would
+    // overwrite unsaved sampler changes when restoring an old preset later.
+    if (manager.getSelectedPresetName() !== selected.name) {
+        const value = manager.findPreset(selected.name);
+        if (value === undefined || value === null) throw Error('无法定位该酒馆预设，请刷新列表。');
+        await manager.selectPreset(value);
+    }
+    const fresh = globalThis.SillyTavern.getContext();
+    if (fresh.mainApi !== selected.api || fresh.getPresetManager?.()?.getSelectedPresetName?.() !== selected.name) {
+        throw Error('酒馆未能应用所选预设，请检查连接后重试。');
+    }
+    return fresh;
+}
+function presetPrompt(context, data) {
+    if (context.mainApi !== 'openai') return data.prompt;
+    const settings = context.chatCompletionSettings;
+    if (!Array.isArray(settings?.prompts)) return data.prompt;
+    const orders = settings.prompt_order || [];
+    const order = orders.find(x => Number(x.character_id) === 100001) ||
+        orders.find(x => String(x.character_id) === String(context.characterId)) ||
+        orders.find(x => Number(x.character_id) === 100000);
+    if (!Array.isArray(order?.order)) return data.prompt;
+    const blocks = new Map(settings.prompts.map(x => [x.identifier, x]));
+    const messages = [], depthBlocks = [];
+    const replace = text => String(text || '').replace(/{{(user|char|persona|description|personality|scenario|mesExamples|original)}}/gi,
+        (_, key) => ({ user: data.player || '玩家', char: '文游叙述者', persona: data.persona || '',
+            description: '', personality: '', scenario: '', mesexamples: '', original: data.systemPrompt })[key.toLowerCase()] || '');
+    let gameAdded = false;
+    for (const entry of order.order) {
+        if (!entry.enabled) continue;
+        const block = blocks.get(entry.identifier);
+        if (!block) continue;
+        if (block.marker) {
+            // Game state replaces chat history. Character cards, other chats,
+            // and their world books are not loaded into this separate game.
+            if (entry.identifier === 'chatHistory' && !gameAdded) {
+                messages.push({ role: 'user', content: data.prompt }); gameAdded = true;
+            }
+            continue;
+        }
+        const content = replace(block.content);
+        if (!content.trim()) continue;
+        const message = { role: ['system', 'user', 'assistant'].includes(block.role) ? block.role : 'system', content };
+        if (Number(block.injection_position) === 1) depthBlocks.push({ message, depth: Math.max(0, Number(block.injection_depth) || 0) });
+        else messages.push(message);
+    }
+    if (!gameAdded) messages.push({ role: 'user', content: data.prompt });
+    for (const { message, depth } of depthBlocks) messages.splice(Math.max(0, messages.length - depth), 0, message);
+    messages.push({ role: 'user', content: '本次为文游工坊的独立游戏请求。沿用上述预设的文风，但输出必须遵守游戏引擎的完整 JSON 结构与五个行动选项，不附加格式外文字。' });
+    if (messages.reduce((sum, x) => sum + x.content.length, 0) > 100000) {
+        throw Error('预设与剧情合计超过 100,000 字符，请精简预设或人设后重试。');
+    }
+    return messages;
+}
+
 async function receive(event) {
     if (!frame || event.source !== frame.contentWindow ||
         event.origin !== location.origin || event.data?.token !== bridgeToken) return;
@@ -206,9 +289,25 @@ async function receive(event) {
         status.hidden = true;
         frame.hidden = false;
         send({ type: 'wenyou:connected' });
+        try { send({ type: 'wenyou:catalog', catalog: getCatalog(globalThis.SillyTavern?.getContext?.()) }); }
+        catch { send({ type: 'wenyou:catalog', catalog: { error: '无法读取酒馆列表，可点击刷新重试。' } }); }
         return;
     }
-    if (!ready || !dialog.open || data.type !== 'wenyou:generate') return;
+    if (!ready || !dialog.open) return;
+    if (data.type === 'wenyou:catalog' || data.type === 'wenyou:persona') {
+        try {
+            const context = globalThis.SillyTavern?.getContext?.();
+            if (data.type === 'wenyou:catalog') send({ type: 'wenyou:catalog', catalog: getCatalog(context) });
+            else if (typeof data.id === 'string' && typeof data.personaId === 'string') {
+                send({ type: 'wenyou:persona-result', id: data.id, persona: readPersona(context, data.personaId) });
+            }
+        } catch (error) {
+            if (data.type === 'wenyou:persona') send({ type: 'wenyou:persona-result', id: data.id, error: error.message });
+            else send({ type: 'wenyou:catalog', catalog: { error: error.message } });
+        }
+        return;
+    }
+    if (data.type !== 'wenyou:generate') return;
     if (typeof data.id !== 'string' || typeof data.prompt !== 'string' ||
         data.prompt.length > 50000 || typeof data.systemPrompt !== 'string' ||
         data.systemPrompt.length > 5000) return;
@@ -220,12 +319,13 @@ async function receive(event) {
     const requestToken = bridgeToken;
     const respond = payload => { if (requestToken === bridgeToken) send(payload); };
     try {
-        const context = globalThis.SillyTavern?.getContext?.();
+        let context = globalThis.SillyTavern?.getContext?.();
         if (typeof context?.generateRaw !== 'function') {
             throw Error('当前酒馆不支持 generateRaw 对象参数接口，请更新至近期官方版本。');
         }
+        context = await usePreset(context, data.preset);
         const result = await context.generateRaw({
-            prompt: data.prompt, systemPrompt: data.systemPrompt, responseLength: 4000,
+            prompt: presetPrompt(context, data), systemPrompt: data.systemPrompt, responseLength: 4000,
         });
         if (typeof result !== 'string' || !result.trim()) {
             throw Error('模型返回为空。请检查酒馆 API 连接与最大回复长度。');

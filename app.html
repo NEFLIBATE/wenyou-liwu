@@ -64990,7 +64990,7 @@ const GENRES=['古风养成','奇幻冒险','校园日常','悬疑探索','末�
 const PERSPECTIVES={first:'第一人称 · 我',second:'第二人称 · 你',third:'第三人称 · 他／她'};
 function normalizeSettings(x={}){
  if(!x||typeof x!=='object')x={};
- return {workTitle:clean(x.workTitle,80).trim(),gender:['未指定','女性','男性','非二元'].includes(x.gender)?x.gender:'未指定',perspective:Object.hasOwn(PERSPECTIVES,x.perspective)?x.perspective:'second',persona:clean(x.persona,2000),storyGenre:GENRES.includes(x.storyGenre)?x.storyGenre:''};
+ return {workTitle:clean(x.workTitle,80).trim(),gender:['未指定','女性','男性','非二元'].includes(x.gender)?x.gender:'未指定',perspective:Object.hasOwn(PERSPECTIVES,x.perspective)?x.perspective:'second',persona:clean(x.persona,x.personaSource==='tavern'?20000:2000),personaSource:x.personaSource==='tavern'?'tavern':'custom',personaId:clean(x.personaId,240),personaName:clean(x.personaName,80),preset:{api:clean(x.preset?.api,80),name:clean(x.preset?.name,240)},storyGenre:GENRES.includes(x.storyGenre)?x.storyGenre:''};
 }
 function parseJSON(raw){
  let text=clean(raw,100000).trim().replace(/<think>[\s\S]*?<\/think>/g,'').replace(/^```(?:json)?\s*/i,'').replace(/\s*```$/,'');
@@ -65125,8 +65125,8 @@ let hostBridge=null;
 try{hostBridge=JSON.parse(document.querySelector('meta[name="wenyou-bridge"]')?.content||'null');}catch{}
 const bridgeToken=hostBridge?.token||params.get('bridge');
 const bridgeOrigin=hostBridge?.origin||location.origin;
-const embedded=window.parent!==window&&Boolean(bridgeToken);const pending=new Map();let bridgeOK=false;
-let state=null,sourceFiles=[],sourceText='',tab='workshop',busy=false,operation=0,dbPromise=null,setupDraft=null,handbookTab='quests';
+const embedded=window.parent!==window&&Boolean(bridgeToken);const pending=new Map();let bridgeOK=false,tavernCatalog=null;
+let state=null,sourceFiles=[],sourceText='',tab='workshop',busy=false,operation=0,dbPromise=null,setupDraft=null,handbookTab='quests',saveTavernDraft=null;
 const sections={workshop:'工坊',story:'剧情',npcs:'人物',journal:'手册',save:'存档'};
 function status(msg=''){ $('status').textContent=msg; }
 function add(parent,...nodes){for(const n of nodes)parent.append(n);return parent;}
@@ -65137,6 +65137,32 @@ function active(name){if(busy)return;if(name!=='workshop'&&!state&&name!=='save'
 function card(title){const c=E('section','card');if(title)c.append(E('h2','',title));return c;}
 function hero(){const h=E('section','hero');add(h,E('div','eyebrow','A STORY FROM YOUR PAGES'),E('h1','', '把资料，变成\n你的下一段人生。'),E('p','','从一页设定开始，让每个选择生长出新的故事。'));h.querySelector('h1').style.whiteSpace='pre-line';
  const art=E('div');art.innerHTML='<svg class="art" viewBox="0 0 340 95" aria-hidden="true"><path d="M0 87 Q55 28 117 64 T245 59 T340 72 V95 H0" fill="#d1dfc8"/><path d="M0 94 Q74 55 160 81 T340 69 V95 H0" fill="#b5caaa"/><circle cx="274" cy="20" r="14" fill="#f4dfaf"/><path d="M125 85V42l25-18 25 18v43" fill="#faf7e8" stroke="#8da381" stroke-width="1.5"/><path d="M118 44l32-23 32 23M145 85V65h12v20" fill="none" stroke="#819a75" stroke-width="2"/><path d="M47 89V41m0 15L30 66m17 3l18-17M300 87V49m0 12l-13 9" stroke="#7f9c74" stroke-width="2"/><ellipse cx="48" cy="33" rx="23" ry="24" fill="#9bb78a"/><ellipse cx="301" cy="43" rx="17" ry="20" fill="#a6be94"/><path d="M151 87q8 5 19 8" stroke="#f9efd7" stroke-width="9" fill="none"/></svg>';h.append(art);return h;}
+function bridgeRequest(type,extra={}){
+ if(!bridgeOK)return Promise.reject(Error('请从酒馆扩展打开工坊后再选择。'));
+ const id=crypto.randomUUID();return new Promise((resolve,reject)=>{const timer=setTimeout(()=>{pending.delete(id);reject(Error('读取酒馆人设超时，请重新选择。'));},10000);pending.set(id,{resolve,reject,timer});window.parent.postMessage({type,token:bridgeToken,id,...extra},bridgeOrigin);});
+}
+function tavernControls(parent,draft,changed){
+ const group=E('div','tavern-controls');
+ function selector(id,label,items,value){const wrap=E('div'),l=E('label','field',label),el=E('select');l.htmlFor=id;el.id=id;for(const [v,t]of items){const o=E('option','',t);o.value=v;el.append(o);}el.value=value;add(wrap,l,el);group.append(wrap);return el;}
+ const catalog=tavernCatalog||{},personas=[['','手动填写人设'],...(catalog.personas||[]).map(x=>[x.id,x.name])];
+ const selected=draft.personaSource==='tavern'?draft.personaId:'';
+ if(selected&&!personas.some(x=>x[0]===selected))personas.push([selected,`${draft.personaName||'已保存人设'} · 存档快照`]);
+ const persona=selector('tavernPersona','酒馆用户人设',personas,selected);persona.disabled=!bridgeOK;
+ persona.addEventListener('change',async()=>{
+  const id=persona.value;if(!id){draft.personaSource='custom';draft.personaId='';draft.personaName='';draft.persona=draft.manualPersona||'';changed();return;}
+  draft.personaLoading=true;persona.disabled=true;status('正在读取酒馆人设…');
+  try{const value=await bridgeRequest('wenyou:persona',{personaId:id});if(draft.personaSource!=='tavern')draft.manualPersona=draft.persona;draft.personaSource='tavern';draft.personaId=value.id;draft.personaName=value.name;draft.persona=value.description;draft.player=value.name.slice(0,40);status(value.description?'已载入人设，主角姓名已同步。':'已载入姓名；该酒馆人设没有填写描述。');}
+  catch(e){showError(e);}finally{draft.personaLoading=false;changed();}
+ });
+ const presets=[['','跟随酒馆当前预设'+(catalog.currentPreset?` · ${catalog.currentPreset}`:'')],...(catalog.presets||[]).map(name=>[JSON.stringify({api:catalog.api,name}),name])];
+ const chosen=draft.preset?.name?JSON.stringify(draft.preset):'';
+ if(chosen&&!presets.some(x=>x[0]===chosen))presets.push([chosen,`${draft.preset.name} · 已保存（请确认 API 与列表）`]);
+ const preset=selector('tavernPreset','酒馆预设',presets,chosen);preset.disabled=!bridgeOK;
+ preset.addEventListener('change',()=>{draft.preset=preset.value?JSON.parse(preset.value):{api:'',name:''};});
+ add(group,E('p','hint',bridgeOK?'人设读取描述并保存快照，可继续编辑主角姓名。指定预设会在 AI 生成时同步切换酒馆当前预设，连接绑定遵循酒馆设置；跟随模式保留酒馆当前设置。':'从酒馆打开可读取用户人设和预设；离线时保留已保存的人设快照。'),E('p','hint','聊天补全预设使用启用的提示词及顺序，人物卡、其他聊天和世界书不自动导入。工坊保留 JSON 游戏结构。'));
+ if(bridgeOK)group.append(button('刷新酒馆人设与预设',()=>{window.parent.postMessage({type:'wenyou:catalog',token:bridgeToken},bridgeOrigin);status('正在刷新酒馆列表…');},'btn small soft'));
+ if(catalog.error)group.append(E('p','hint',catalog.error));parent.append(group);
+}
 function workshop(root){
  root.append(hero());const c=card('01  导入你的世界');
  const drop=E('label','drop');drop.htmlFor='files';add(drop,E('span','','▧'),E('strong','','点击上传游戏资料'),E('span','hint','PDF · DOCX · TXT · MD · JSON / CSV 文本'));
@@ -65155,9 +65181,10 @@ function workshop(root){
  const gender=select('gender',['未指定','女性','男性','非二元'].map(x=>[x,x]));
  const perspective=select('perspective',Object.entries(C.PERSPECTIVES));
  add(fields,add(E('div','setup-pair title-pair'),field('workTitle','作品名称',workTitle,'可由 AI 生成'),field('player','主角姓名',name)),add(E('div','setup-pair'),field('gender','主角性别',gender),field('perspective','叙事人称',perspective)));
- const persona=E('textarea');persona.maxLength=2000;persona.rows=4;persona.value=setupDraft.persona;persona.placeholder='填写主角的性格、背景、外貌、能力、目标和人际关系。例如：外冷内热的大一新生，擅长观察，希望找到失联的旧友。';
+ tavernControls(fields,setupDraft,()=>render());
+ const persona=E('textarea');persona.maxLength=setupDraft.personaSource==='tavern'?20000:2000;persona.readOnly=setupDraft.personaSource==='tavern';persona.rows=4;persona.value=setupDraft.persona;persona.placeholder='填写主角的性格、背景、外貌、能力、目标和人际关系。例如：外冷内热的大一新生，擅长观察，希望找到失联的旧友。';
  const personaWrap=field('persona','人设设定',persona,'可选'),count=E('p','persona-count');count.id='personaCount';count.setAttribute('aria-live','polite');
- function countPersona(){count.textContent=`${persona.value.length.toLocaleString()} / 2,000 字符 · 将用于开场与后续 AI 剧情`;}
+ function countPersona(){count.textContent=setupDraft.personaSource==='tavern'?`${persona.value.length.toLocaleString()} 字符 · ${setupDraft.personaName} 的人设快照（只读）`:`${persona.value.length.toLocaleString()} / 2,000 字符 · 将用于开场与后续 AI 剧情`;}
  persona.addEventListener('input',()=>{setupDraft.persona=persona.value;countPersona();});countPersona();persona.setAttribute('aria-describedby','personaCount');personaWrap.append(count);fields.append(personaWrap);
  const genres=E('div'),genreLabel=E('p','setup-label','故事题材'),genreGrid=E('div','genre-grid');genreLabel.id='genreLabel';genreGrid.setAttribute('role','group');genreGrid.setAttribute('aria-labelledby','genreLabel');
  for(const genre of C.GENRES){const chip=button('',()=>{setupDraft.storyGenre=genre;for(const el of genreGrid.children){const chosen=el.dataset.genre===genre;el.setAttribute('aria-pressed',String(chosen));el.textContent=(chosen?'✓ ':'')+el.dataset.genre;}},'genre-chip');chip.dataset.genre=genre;chip.setAttribute('aria-pressed',String(setupDraft.storyGenre===genre));chip.textContent=(setupDraft.storyGenre===genre?'✓ ':'')+genre;genreGrid.append(chip);}
@@ -65175,7 +65202,7 @@ async function loadFiles(files){
  }catch(e){showError(e);}finally{if(ticket===operation)busyUI(false);}
 }
 async function start(){
- if(busy)return;sourceText=$('source').value;const s=C.create(sourceText,$('player').value,$('style').value,{workTitle:$('workTitle').value,gender:$('gender').value,perspective:$('perspective').value,persona:$('persona').value,storyGenre:setupDraft.storyGenre});s.mode=$('mode').value;s.files=sourceFiles.slice();
+ if(busy)return;if(setupDraft?.personaLoading)throw Error('请等待人设读取完成。');sourceText=$('source').value;const s=C.create(sourceText,$('player').value,$('style').value,{...C.normalizeSettings(setupDraft),workTitle:$('workTitle').value,gender:$('gender').value,perspective:$('perspective').value,persona:$('persona').value,storyGenre:setupDraft.storyGenre});s.mode=$('mode').value;s.files=sourceFiles.slice();
  if(state&&!confirm('重新开场会替换当前自动存档。要保留旧进度，请先去「存档」导出。继续吗？'))return;
  await generate(s,'开始游戏',true);
 }
@@ -65229,8 +65256,10 @@ function saves(root){
  const file=E('input');file.type='file';file.id='saveFile';file.accept='.json';file.className='hidden';file.addEventListener('change',()=>importSave(file.files[0]));c.append(file);
  if(state){add(c,button('↧  导出完整存档 JSON',()=>download(JSON.stringify({...state,savedAt:new Date().toISOString()},null,2),`${safeName(state.title)}-存档.json`,'application/json'),'btn primary full'),button('▧  导出可离线打开的单文件 HTML',exportHTML,'btn full'));}root.append(c);
  if(state){const modes=card('剧情生成方式');modes.append(E('p','hint',`当前：${state.mode==='ai'?'酒馆 AI':'本地规则体验'}`));if(bridgeOK)modes.append(button(state.mode==='ai'?'切换为本地体验':'开启酒馆 AI 原创剧情',async()=>{state.mode=state.mode==='ai'?'local':'ai';await persist();render();},'btn soft full'));else modes.append(E('p','hint','请从酒馆扩展打开本页面以启用 AI。'));root.append(modes);}
+ if(state){const config=card('人设与预设');const draft=saveTavernDraft||(saveTavernDraft={...C.normalizeSettings(state.settings),player:state.player});
+ const draw=()=>{config.replaceChildren(E('h2','','人设与预设'));tavernControls(config,draft,draw);config.append(E('p','hint',`主角：${draft.player} · 人设 ${draft.persona.length.toLocaleString()} 字符`),button('保存到当前旅程',async()=>{if(draft.personaLoading)throw Error('请等待人设读取完成。');state.settings=C.normalizeSettings(draft);state.player=draft.player;setupDraft=null;saveTavernDraft=null;await persist();render();status('人设与预设已保存，下一次 AI 生成生效。');},'btn primary full'));};draw();root.append(config);}
  const info=card('使用说明');add(info,E('p','hint','PDF / DOCX 在浏览器本地提取文字；文本按换行展示，不执行文件内容中的 HTML 或 JavaScript。PDF 中的图片与扫描文字不识别，复杂表格的版面不会保留。'),E('p','hint','通用属性固定为体力、心情、洞察、资源；AI 可根据原设定叙事，但不解析任意复杂规则系统。关系值由前端累计。AI 长篇资料使用相关片段检索，不保证每条细节都被模型记住。'),E('p','hint','独立 HTML 与离线导出的页面均可继续本地规则玩法。AI 模式需要酒馆扩展和已连接的模型。'));
- if(state)info.append(button('清除本设备自动存档',async()=>{if(confirm('这会清除本设备的当前进度。已导出的文件不受影响。继续吗？')){await store(null);state=null;setupDraft=null;tab='workshop';render();status('自动存档已清除。');}},'btn danger full'));root.append(info);
+ if(state)info.append(button('清除本设备自动存档',async()=>{if(confirm('这会清除本设备的当前进度。已导出的文件不受影响。继续吗？')){await store(null);state=null;setupDraft=null;saveTavernDraft=null;tab='workshop';render();status('自动存档已清除。');}},'btn danger full'));root.append(info);
 }
 function safeName(s){return (s||'文游').replace(/[<>:"/\\|?*\x00-\x1f]/g,'_').slice(0,60);}
 function download(data,name,type){const url=URL.createObjectURL(new Blob([data],{type}));const a=E('a');a.href=url;a.download=name;document.body.append(a);a.click();a.remove();setTimeout(()=>URL.revokeObjectURL(url),30000);}
@@ -65246,20 +65275,20 @@ async function exportHTML(){
  html='<!doctype html>\n'+parsed.documentElement.outerHTML;
  download(html,`${safeName(state.title)}-文游.html`,'text/html;charset=utf-8');status('已导出单文件。离开酒馆后可使用本地规则继续；重新进入酒馆可导入 JSON 存档恢复 AI。');
 }
-async function importSave(file){if(!file)return;try{if(file.size>8*1024*1024)throw Error('存档超过8MB。');const nextState=C.restore(JSON.parse(await file.text()));if(state&&!confirm('导入会替换当前自动存档，继续吗？'))return;state=nextState;setupDraft=null;if(!bridgeOK)state.mode='local';sourceText=state.source;sourceFiles=state.files||[];tab='story';await persist();render();status('存档已恢复。');}catch(e){showError(e);}}
+async function importSave(file){if(!file)return;try{if(file.size>8*1024*1024)throw Error('存档超过8MB。');const nextState=C.restore(JSON.parse(await file.text()));if(state&&!confirm('导入会替换当前自动存档，继续吗？'))return;state=nextState;setupDraft=null;saveTavernDraft=null;if(!bridgeOK)state.mode='local';sourceText=state.source;sourceFiles=state.files||[];tab='story';await persist();render();status('存档已恢复。');}catch(e){showError(e);}}
 function db(){if(!dbPromise)dbPromise=new Promise((resolve,reject)=>{const r=indexedDB.open('wenyou-forge-v1',1);r.onupgradeneeded=()=>r.result.createObjectStore('saves');r.onsuccess=()=>resolve(r.result);r.onerror=()=>reject(r.error);});return dbPromise;}
 async function store(value){const d=await db();return new Promise((resolve,reject)=>{const tx=d.transaction('saves','readwrite');const os=tx.objectStore('saves');if(value)os.put(value,'active');else os.delete('active');tx.oncomplete=()=>resolve();tx.onerror=()=>reject(tx.error);tx.onabort=()=>reject(tx.error||Error('存档事务中止'));});}
 async function load(){const d=await db();return new Promise((resolve,reject)=>{const r=d.transaction('saves').objectStore('saves').get('active');r.onsuccess=()=>resolve(r.result);r.onerror=()=>reject(r.error);});}
 async function persist(){try{await store(state);return true;}catch{status('本次进度已生成，但浏览器未能自动保存。请到「存档」立即导出 JSON。');return false;}}
 async function requestAI(s,action,initial,plan){
  if(!bridgeOK)throw Error('AI 连接尚未就绪，请从酒馆扩展打开本页面。');
- const id=crypto.randomUUID();const prompt=C.prompt(s,action,initial,plan);
- return new Promise((resolve,reject)=>{const timer=setTimeout(()=>{pending.delete(id);reject(Error('模型等待超过180秒。旧回复会被忽略；请等酒馆结束生成后再重试，当前进度未改变。'));},180000);pending.set(id,{resolve,reject,timer});window.parent.postMessage({type:'wenyou:generate',token:bridgeToken,id,prompt,systemPrompt:C.SYSTEM},bridgeOrigin);});
+ const id=crypto.randomUUID();const prompt=C.prompt(s,action,initial,plan);if(prompt.length>50000)throw Error('人设与剧情合计超过 50,000 字符，请精简人设或资料后重试。');
+ return new Promise((resolve,reject)=>{const timer=setTimeout(()=>{pending.delete(id);reject(Error('模型等待超过180秒。旧回复会被忽略；请等酒馆结束生成后再重试，当前进度未改变。'));},180000);pending.set(id,{resolve,reject,timer});window.parent.postMessage({type:'wenyou:generate',token:bridgeToken,id,prompt,systemPrompt:C.SYSTEM,preset:s.settings.preset,player:s.player,persona:s.settings.persona},bridgeOrigin);});
 }
-window.addEventListener('message',e=>{if(!embedded||e.source!==window.parent||e.origin!==bridgeOrigin||e.data?.token!==bridgeToken)return;const d=e.data;if(d.type==='wenyou:connected'){bridgeOK=true;$('bridgeBadge').textContent='酒馆已连接';if(tab==='workshop'&&!busy)render();return;}if(d.type==='wenyou:result'){const p=pending.get(d.id);if(!p)return;clearTimeout(p.timer);pending.delete(d.id);d.error?p.reject(Error(d.error)):p.resolve(d.text);}});
+window.addEventListener('message',e=>{if(!embedded||e.source!==window.parent||e.origin!==bridgeOrigin||e.data?.token!==bridgeToken)return;const d=e.data;if(d.type==='wenyou:connected'){bridgeOK=true;$('bridgeBadge').textContent='酒馆已连接';if(tab==='workshop'&&!busy)render();return;}if(d.type==='wenyou:catalog'){tavernCatalog=d.catalog||{};if(['workshop','save'].includes(tab)&&!busy)render();return;}if(d.type==='wenyou:result'||d.type==='wenyou:persona-result'){const p=pending.get(d.id);if(!p)return;clearTimeout(p.timer);pending.delete(d.id);d.error?p.reject(Error(d.error)):p.resolve(d.type==='wenyou:persona-result'?d.persona:d.text);}});
 async function generate(base,action,initial,options={}){
  if(busy)return;let plan=null;try{if(!initial)plan=C.planAction(base,action,options);}catch(e){showError(e);return;}const ticket=++operation;status();busyUI(true,base.mode==='ai'?'正在根据资料编织下一幕…':'正在整理下一幕…');
- try{const raw=base.mode==='ai'?C.parseJSON(await requestAI(base,action,initial,plan)):C.localResponse(base,action,initial,plan);if(ticket!==operation)return;const result=C.apply(base,raw,action,initial,plan);state=result;setupDraft=null;sourceText=state.source;sourceFiles=state.files||[];tab='story';await persist();render();window.scrollTo({top:0,behavior:'instant'});
+ try{const raw=base.mode==='ai'?C.parseJSON(await requestAI(base,action,initial,plan)):C.localResponse(base,action,initial,plan);if(ticket!==operation)return;const result=C.apply(base,raw,action,initial,plan);state=result;setupDraft=null;saveTavernDraft=null;sourceText=state.source;sourceFiles=state.files||[];tab='story';await persist();render();window.scrollTo({top:0,behavior:'instant'});
  }catch(e){showError(e);}finally{if(ticket===operation)busyUI(false);}
 }
 function next(action,options={}){return generate(state,action,false,options);}
