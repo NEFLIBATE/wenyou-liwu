@@ -1,6 +1,6 @@
 /* 文游工坊 SillyTavern adapter · MIT */
 const EXT_URL = new URL('./', import.meta.url);
-const VERSION = '1.0.2';
+const VERSION = '1.1.0';
 let dialog, frame, bridgeToken, status, retry, closeButton;
 let ready = false, loading = false, inFlight = false, loadNumber = 0;
 let timer, templatePromise, previousFocus, scrollStyles;
