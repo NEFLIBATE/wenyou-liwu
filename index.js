@@ -1,8 +1,8 @@
 /* 文游工坊 SillyTavern adapter · MIT */
 const EXT_URL = new URL('./', import.meta.url);
-const VERSION = '1.3.0';
+const VERSION = '1.4.0';
 let dialog, frame, bridgeToken, status, retry, closeButton;
-let ready = false, loading = false, inFlight = false, loadNumber = 0;
+let ready = false, loading = false, inFlight = false, loadNumber = 0, activeGeneration = null;
 let timer, templatePromise, previousFocus, scrollStyles;
 
 // A shadow root isolates the modal from tavern themes and stale host styles.
@@ -276,6 +276,60 @@ function presetPrompt(context, data) {
     return messages;
 }
 
+// Uses native Tavern payload conversion so credentials never enter the game frame.
+function generationError(error) {
+    const raw = String(error?.message || error?.error?.message || error?.statusText || error || '模型生成失败。');
+    const code = Number(error?.status || error?.response?.status || raw.match(/(?:status|HTTP|code|错误)?\s*(524|503|502|504|429)\b/i)?.[1]) || 0;
+    if (code === 524 || code === 504) return { code, error: `模型上游响应超时（${code}）。本次设定和进度已保留。可用「精简后重试」减少等待；若仍失败，请在酒馆更换模型或连接。` };
+    if ([503, 502].includes(code) || /service unavailable|bad gateway/i.test(raw)) return { code: code || 503, error: `酒馆模型服务暂时不可用（${code || 503}）。设定和进度已保留；稍后重试，或在酒馆切换可用的模型连接。` };
+    if (code === 429) return { code, error: '模型服务请求过多或额度受限（429）。请稍后重试，并检查酒馆模型的额度。' };
+    if (error?.name === 'AbortError') return { code: 0, error: '本次生成已停止或超时，设定和进度未改变。可以重新尝试。' };
+    return { code, error: raw };
+}
+async function generateGame(context, data, controller, progress) {
+    const prompt = presetPrompt(context, data), service = context.ChatCompletionService;
+    const responseLength = data.compact ? 1800 : 2600;
+    if (!data.compatibility && context.mainApi === 'openai' && typeof service?.presetToGeneratePayload === 'function' &&
+        typeof service?.sendRequest === 'function' && typeof context.getChatCompletionModel === 'function') {
+        const source = Array.isArray(prompt) ? prompt : [{ role: 'user', content: prompt }];
+        const messages = [{ role: 'system', content: data.systemPrompt }, ...source].map(message => ({
+            ...message, content: typeof context.substituteParams === 'function' ? context.substituteParams(message.content) : message.content,
+        }));
+        const payload = await service.presetToGeneratePayload({}, {}, {
+            messages, model: context.getChatCompletionModel(), stream: true, n: 1,
+        });
+        // Some native providers convert the budget to max_completion_tokens.
+        // Do not reintroduce max_tokens after that conversion or send both keys.
+        if (Object.hasOwn(payload, 'max_completion_tokens')) {
+            payload.max_completion_tokens = Math.max(4096, responseLength);
+            delete payload.max_tokens;
+        } else payload.max_tokens = responseLength;
+        controller.signal.throwIfAborted();
+        progress('已提交生成请求，正在等待模型开始回复…');
+        const result = await service.sendRequest(payload, true, controller.signal);
+        if (typeof result !== 'function') {
+            if (typeof result?.content === 'string') return result.content;
+            throw Error('酒馆流式接口返回格式不兼容。请更新酒馆，或使用兼容请求模式。');
+        }
+        let text = '', lastUpdate = 0;
+        for await (const chunk of result()) {
+            controller.signal.throwIfAborted();
+            if (typeof chunk?.text === 'string') text = chunk.text;
+            if (text.length > 100000) throw Error('模型回复超过限制，请缩短预设和回复篇幅。');
+            if (Date.now() - lastUpdate > 600) {
+                progress(text ? `正在接收剧情…已收到 ${text.length.toLocaleString()} 字符` : '模型正在处理请求，请稍候…');
+                lastUpdate = Date.now();
+            }
+        }
+        return text;
+    }
+    // Older/forked Tavern hosts retain their existing adapter and provider routing.
+    // A failed request is never silently sent a second time through another path.
+    if (typeof context.generateRaw !== 'function') throw Error('当前酒馆缺少可用的生成接口，请更新酒馆。');
+    progress('酒馆正在生成剧情，请稍候…');
+    return context.generateRaw({ prompt, systemPrompt: data.systemPrompt, responseLength });
+}
+
 async function receive(event) {
     if (!frame || event.source !== frame.contentWindow ||
         event.origin !== location.origin || event.data?.token !== bridgeToken) return;
@@ -307,6 +361,10 @@ async function receive(event) {
         }
         return;
     }
+    if (data.type === 'wenyou:cancel') {
+        if (activeGeneration?.id === data.id && activeGeneration.token === bridgeToken) activeGeneration.controller.abort();
+        return;
+    }
     if (data.type !== 'wenyou:generate') return;
     if (typeof data.id !== 'string' || typeof data.prompt !== 'string' ||
         data.prompt.length > 50000 || typeof data.systemPrompt !== 'string' ||
@@ -318,22 +376,25 @@ async function receive(event) {
     inFlight = true;
     const requestToken = bridgeToken;
     const respond = payload => { if (requestToken === bridgeToken) send(payload); };
+    const controller = new AbortController();
+    activeGeneration = { id: data.id, token: requestToken, controller };
+    const deadline = setTimeout(() => controller.abort(), 240000);
     try {
         let context = globalThis.SillyTavern?.getContext?.();
-        if (typeof context?.generateRaw !== 'function') {
+        if (!context) {
             throw Error('当前酒馆不支持 generateRaw 对象参数接口，请更新至近期官方版本。');
         }
         context = await usePreset(context, data.preset);
-        const result = await context.generateRaw({
-            prompt: presetPrompt(context, data), systemPrompt: data.systemPrompt, responseLength: 4000,
-        });
+        const result = await generateGame(context, data, controller, message => respond({ type: 'wenyou:progress', id: data.id, message }));
         if (typeof result !== 'string' || !result.trim()) {
-            throw Error('模型返回为空。请检查酒馆 API 连接与最大回复长度。');
+            throw Error('模型没有返回剧情正文。请检查酒馆连接；若模型启用了长思考，可降低思考强度或换用响应更快的模型。');
         }
         respond({ type: 'wenyou:result', id: data.id, text: result });
     } catch (error) {
-        respond({ type: 'wenyou:result', id: data.id, error: error?.message || '模型生成失败。请检查酒馆连接。' });
+        respond({ type: 'wenyou:result', id: data.id, ...generationError(error) });
     } finally {
+        clearTimeout(deadline);
+        activeGeneration = null;
         inFlight = false;
     }
 }
