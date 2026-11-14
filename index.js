@@ -1,6 +1,6 @@
 /* 文游工坊 SillyTavern adapter · MIT */
 const EXT_URL = new URL('./', import.meta.url);
-const VERSION = '1.5.0';
+const VERSION = '1.5.1';
 let dialog, frame, bridgeToken, status, retry, closeButton;
 let ready = false, loading = false, inFlight = false, loadNumber = 0, activeGeneration = null;
 let timer, templatePromise, previousFocus, scrollStyles;
@@ -326,11 +326,15 @@ async function readModelResponse(response, controller, diagnostics, report, limi
     if (!response.body) throw Error('酒馆返回了空响应体。');
     const reader = response.body.getReader(), decoder = new TextDecoder();
     let buffer = '', text = '', bytes = 0, packets = 0, done = false, lastReport = 0;
+    diagnostics.heartbeats = 0; diagnostics.emptyPackets = 0; diagnostics.contentPackets = 0;
     let format = /ndjson/i.test(mime) ? 'ndjson' : /event-stream/i.test(mime) ? 'sse' : /json/i.test(mime) ? 'json' : 'detect';
     function accept(packet) {
         if (Array.isArray(packet)) { for (const item of packet) accept(item); return; }
         packets++; diagnostics.packets = packets;
+        if (['ping','heartbeat','keepalive','keep-alive'].includes(packet?.type)) { diagnostics.heartbeats++; return; }
         const part = replyPart(packet);
+        if (part.text || part.thinking || part.done) diagnostics.contentPackets++;
+        if (!part.text && !part.thinking && !part.done) diagnostics.emptyPackets++;
         if (part.text) { text = part.replace ? part.text : text + part.text; diagnostics.outputChars = text.length; diagnostics.stage = 'text'; }
         else if (part.thinking) diagnostics.stage = 'thinking';
         if (part.done) done = true;
@@ -338,7 +342,7 @@ async function readModelResponse(response, controller, diagnostics, report, limi
     }
     function parseEvent(event) {
         const payload = event.split(/\r?\n|\r/).filter(line => line.startsWith('data:')).map(line => line.slice(5).replace(/^ /, '')).join('\n').trim();
-        if (!payload) return;
+        if (!payload) { if (event.split(/\r?\n|\r/).some(line => line.startsWith(':'))) diagnostics.heartbeats++; return; }
         if (payload === '[DONE]') { done = true; return; }
         try { accept(JSON.parse(payload)); } catch (error) { if (error instanceof SyntaxError) throw Error('模型流中的 data 不是有效 JSON；请查看诊断并尝试兼容模式。'); throw error; }
     }
@@ -381,7 +385,7 @@ async function readModelResponse(response, controller, diagnostics, report, limi
             if (buffer.length > 1500000) throw Error('模型响应数据过大，已停止读取。');
             consume();
             if (Date.now() - lastReport > 500) {
-                report(text ? `正在接收剧情…已收到 ${text.length.toLocaleString()} 字符` : diagnostics.stage === 'thinking' ? '模型连接正常，正在思考，尚未返回剧情正文…' : `已收到 ${bytes.toLocaleString()} 字节，等待可用正文…`);
+                report(text ? `正在接收剧情…已收到 ${text.length.toLocaleString()} 字符` : diagnostics.stage === 'thinking' ? '已收到思考数据，尚未收到剧情正文…' : diagnostics.heartbeats ? `仅收到 ${diagnostics.heartbeats} 次保活消息，模型尚未返回正文…` : `已收到 ${bytes.toLocaleString()} 字节，等待可用正文…`);
                 lastReport = Date.now();
             }
         }
@@ -389,18 +393,40 @@ async function readModelResponse(response, controller, diagnostics, report, limi
         return text;
     } finally { void reader.cancel().catch(() => {}); try { reader.releaseLock(); } catch {} }
 }
+async function nativeRequestEvent(context, key, value, controller, diagnostics, limits) {
+    const type = context.eventTypes?.[key];
+    const supported = Boolean(type && typeof context.eventSource?.emit === 'function');
+    const field = key === 'CHAT_COMPLETION_SETTINGS_READY' ? 'settingsEvent' : 'promptEvent';
+    diagnostics[field] = supported ? 'pending' : 'unavailable';
+    if (!supported) return;
+    const previous = diagnostics.stage;
+    diagnostics.stage = 'native-config';
+    await waitRequest(context.eventSource.emit(type, value), controller, limits.prepare,
+        requestFault('native-config', '酒馆的连接扩展未能在时限内完成请求配置。尚未发送模型请求。'));
+    controller.signal.throwIfAborted();
+    diagnostics[field] = 'applied';
+    diagnostics.stage = previous;
+}
 async function generateGame(context, data, controller, progress, diagnostics = {}, task = {}, limits = REQUEST_LIMITS) {
     const quick = data.generationMode === 'quick' || data.test === true;
     const prompt = quick ? data.prompt : presetPrompt(context, data), service = context.ChatCompletionService;
     const responseLength = data.test ? 256 : quick ? 1400 : data.compact ? 1800 : 2600;
     diagnostics.started = Date.now(); diagnostics.mode = data.test ? 'probe' : quick ? 'quick' : 'full';
     diagnostics.stage = 'prepare'; diagnostics.inputChars = data.prompt.length; diagnostics.bytes = 0; diagnostics.outputChars = 0;
-    const totalTimer = setTimeout(() => controller.abort(requestFault('total', `本次${data.test ? '连接测试' : '生成'}已达到时限；阶段：${diagnostics.stage}，收到 ${diagnostics.bytes ?? '未知'} 字节、${diagnostics.outputChars || 0} 字正文。进度未改变。`)), data.test ? limits.probeTotal : quick ? limits.quickTotal : limits.fullTotal);
+    const totalTimer = setTimeout(() => controller.abort(requestFault(diagnostics.heartbeats && !diagnostics.outputChars && !diagnostics.contentPackets ? 'heartbeat-only' : 'total', diagnostics.heartbeats && !diagnostics.outputChars && !diagnostics.contentPackets ? `酒馆返回 HTTP 200，但只收到 ${diagnostics.heartbeats} 次保活消息，没有模型正文。请对比同一模型的酒馆普通聊天；本次未写入进度。` : `本次${data.test ? '连接测试' : '生成'}已达到时限；阶段：${diagnostics.stage}，收到 ${diagnostics.bytes ?? '未知'} 字节、${diagnostics.outputChars || 0} 字正文。进度未改变。`)), data.test ? limits.probeTotal : quick ? limits.quickTotal : limits.fullTotal);
     const report = message => { diagnostics.elapsedMs = Date.now() - diagnostics.started; progress(message); };
     try {
         if (!data.compatibility && context.mainApi === 'openai' && typeof service?.presetToGeneratePayload === 'function' && typeof context.getChatCompletionModel === 'function') {
             const source = Array.isArray(prompt) ? prompt : [{ role: 'user', content: prompt }];
-            const messages = [{ role: 'system', content: data.systemPrompt }, ...source].map(message => ({ ...message, content: !quick && typeof context.substituteParams === 'function' ? context.substituteParams(message.content) : message.content }));
+            let messages = [{ role: 'system', content: data.systemPrompt }, ...source].map(message => ({ ...message, content: !quick && typeof context.substituteParams === 'function' ? context.substituteParams(message.content) : message.content }));
+            // Match native generateRaw -> CHAT_COMPLETION_PROMPT_READY.
+            // A connection-only probe must not load chat/persona prompt extensions.
+            if (!data.test) {
+                const event = { chat: messages, dryRun: false };
+                await nativeRequestEvent(context, 'CHAT_COMPLETION_PROMPT_READY', event, controller, diagnostics, limits);
+                messages = event.chat;
+                if (!Array.isArray(messages) || !messages.length) throw Error('酒馆提示词扩展返回了无效的消息列表，未发送请求。');
+            }
             const payload = await waitRequest(service.presetToGeneratePayload({}, {}, { messages, model: context.getChatCompletionModel(), stream: true, n: 1 }), controller, limits.prepare, requestFault('prepare', '酒馆准备请求超时。请检查当前预设或连接配置。'));
             if (quick) {
                 if (payload.reasoning_effort != null && payload.reasoning_effort !== 'none') payload.reasoning_effort = 'low';
@@ -410,6 +436,12 @@ async function generateGame(context, data, controller, progress, diagnostics = {
             const budget = Object.hasOwn(payload, 'max_completion_tokens') ? Math.max(quick ? 2048 : 4096, responseLength) : responseLength;
             if (Object.hasOwn(payload, 'max_completion_tokens')) { payload.max_completion_tokens = budget; delete payload.max_tokens; }
             else payload.max_tokens = quick && payload.reasoning_effort && payload.reasoning_effort !== 'none' ? Math.max(2048, budget) : budget;
+            // Native sendOpenAIRequest emits this after building its payload.
+            // Cloud/connection extensions can supply the selected model, route
+            // and secret identifier here; keep their edits in the parent only.
+            await nativeRequestEvent(context, 'CHAT_COMPLETION_SETTINGS_READY', payload, controller, diagnostics, limits);
+            if (typeof payload.model !== 'string' || !payload.model.trim()) throw Error('酒馆请求没有模型名称，请先在酒馆 API 连接中选择模型。');
+            if (!Array.isArray(payload.messages) || !payload.messages.length) throw Error('酒馆连接扩展返回了无效的请求消息，未发送请求。');
             diagnostics.maxTokens = payload.max_completion_tokens || payload.max_tokens;
             diagnostics.api = String(context.mainApi || '').slice(0, 40);
             diagnostics.stage = 'request';
