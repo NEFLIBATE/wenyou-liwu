@@ -1,6 +1,6 @@
 /* 文游工坊 SillyTavern adapter · MIT */
 const EXT_URL = new URL('./', import.meta.url);
-const VERSION = '1.4.0';
+const VERSION = '1.5.0';
 let dialog, frame, bridgeToken, status, retry, closeButton;
 let ready = false, loading = false, inFlight = false, loadNumber = 0, activeGeneration = null;
 let timer, templatePromise, previousFocus, scrollStyles;
@@ -286,48 +286,156 @@ function generationError(error) {
     if (error?.name === 'AbortError') return { code: 0, error: '本次生成已停止或超时，设定和进度未改变。可以重新尝试。' };
     return { code, error: raw };
 }
-async function generateGame(context, data, controller, progress) {
-    const prompt = presetPrompt(context, data), service = context.ChatCompletionService;
-    const responseLength = data.compact ? 1800 : 2600;
-    if (!data.compatibility && context.mainApi === 'openai' && typeof service?.presetToGeneratePayload === 'function' &&
-        typeof service?.sendRequest === 'function' && typeof context.getChatCompletionModel === 'function') {
-        const source = Array.isArray(prompt) ? prompt : [{ role: 'user', content: prompt }];
-        const messages = [{ role: 'system', content: data.systemPrompt }, ...source].map(message => ({
-            ...message, content: typeof context.substituteParams === 'function' ? context.substituteParams(message.content) : message.content,
-        }));
-        const payload = await service.presetToGeneratePayload({}, {}, {
-            messages, model: context.getChatCompletionModel(), stream: true, n: 1,
-        });
-        // Some native providers convert the budget to max_completion_tokens.
-        // Do not reintroduce max_tokens after that conversion or send both keys.
-        if (Object.hasOwn(payload, 'max_completion_tokens')) {
-            payload.max_completion_tokens = Math.max(4096, responseLength);
-            delete payload.max_tokens;
-        } else payload.max_tokens = responseLength;
-        controller.signal.throwIfAborted();
-        progress('已提交生成请求，正在等待模型开始回复…');
-        const result = await service.sendRequest(payload, true, controller.signal);
-        if (typeof result !== 'function') {
-            if (typeof result?.content === 'string') return result.content;
-            throw Error('酒馆流式接口返回格式不兼容。请更新酒馆，或使用兼容请求模式。');
+const REQUEST_LIMITS = { prepare: 15000, headers: 45000, firstByte: 30000, idle: 30000, quickTotal: 90000, fullTotal: 150000, probeTotal: 30000 };
+function requestFault(kind, message) { return Object.assign(new Error(message), { name: 'GenerationTimeout', kind }); }
+function abortReason(signal) { return signal.reason instanceof Error ? signal.reason : new DOMException('已取消生成', 'AbortError'); }
+function waitRequest(promise, controller, ms = 0, fault = null) {
+    return new Promise((resolve, reject) => {
+        let timer;
+        const stop = () => { clearTimeout(timer); controller.signal.removeEventListener('abort', aborted); };
+        const aborted = () => { stop(); reject(abortReason(controller.signal)); };
+        if (controller.signal.aborted) { reject(abortReason(controller.signal)); return; }
+        controller.signal.addEventListener('abort', aborted, { once: true });
+        if (ms) timer = setTimeout(() => controller.abort(fault), ms);
+        Promise.resolve(promise).then(value => { stop(); resolve(value); }, error => { stop(); reject(error); });
+    });
+}
+function contentText(value) {
+    if (typeof value === 'string') return value;
+    if (Array.isArray(value)) return value.filter(x => !x?.thought && x?.type !== 'thinking').map(x => typeof x === 'string' ? x : typeof x?.text === 'string' ? x.text : '').join('');
+    return '';
+}
+function replyPart(data) {
+    if (data?.error) throw Object.assign(new Error(typeof data.error?.message === 'string' ? data.error.message : '模型接口返回错误响应。'), { status: data.error?.status || data.error?.code });
+    const choice = data?.choices?.find?.(x => !x.index) || data?.choices?.[0];
+    if (choice) return { text: contentText(choice.delta?.content ?? choice.message?.content ?? choice.text), replace: !choice.delta, done: Boolean(choice.finish_reason), thinking: Boolean(choice.delta?.reasoning_content || choice.delta?.reasoning || choice.message?.reasoning_content) };
+    const parts = data?.candidates?.[0]?.content?.parts;
+    if (Array.isArray(parts)) return { text: contentText(parts), thinking: parts.some(x => x.thought), done: Boolean(data.candidates[0].finishReason) };
+    if (data?.type === 'content_block_delta') return { text: data.delta?.type === 'thinking_delta' ? '' : contentText(data.delta?.text), thinking: data.delta?.type === 'thinking_delta' };
+    if (data?.type === 'message_stop') return { text: '', done: true };
+    if (data?.delta?.message?.content?.text) return { text: data.delta.message.content.text };
+    if (data?.type === 'response.output_text.delta') return { text: contentText(data.delta) };
+    return { text: contentText(data?.content ?? data?.text ?? data?.response ?? data?.message?.content), replace: true, done: data?.done === true };
+}
+async function readModelResponse(response, controller, diagnostics, report, limits = REQUEST_LIMITS) {
+    diagnostics.httpStatus = response.status;
+    const mime = response.headers.get('content-type') || '';
+    diagnostics.contentType = mime.split(';')[0].slice(0, 60);
+    diagnostics.stage = 'headers'; report(`酒馆已响应 HTTP ${response.status}，正在读取正文…`);
+    if (!response.ok) { void response.body?.cancel().catch(() => {}); throw Object.assign(new Error(`HTTP ${response.status}`), { status: response.status }); }
+    if (!response.body) throw Error('酒馆返回了空响应体。');
+    const reader = response.body.getReader(), decoder = new TextDecoder();
+    let buffer = '', text = '', bytes = 0, packets = 0, done = false, lastReport = 0;
+    let format = /ndjson/i.test(mime) ? 'ndjson' : /event-stream/i.test(mime) ? 'sse' : /json/i.test(mime) ? 'json' : 'detect';
+    function accept(packet) {
+        if (Array.isArray(packet)) { for (const item of packet) accept(item); return; }
+        packets++; diagnostics.packets = packets;
+        const part = replyPart(packet);
+        if (part.text) { text = part.replace ? part.text : text + part.text; diagnostics.outputChars = text.length; diagnostics.stage = 'text'; }
+        else if (part.thinking) diagnostics.stage = 'thinking';
+        if (part.done) done = true;
+        if (text.length > 100000) throw Error('模型回复超过 100,000 字符，请缩短回复。');
+    }
+    function parseEvent(event) {
+        const payload = event.split(/\r?\n|\r/).filter(line => line.startsWith('data:')).map(line => line.slice(5).replace(/^ /, '')).join('\n').trim();
+        if (!payload) return;
+        if (payload === '[DONE]') { done = true; return; }
+        try { accept(JSON.parse(payload)); } catch (error) { if (error instanceof SyntaxError) throw Error('模型流中的 data 不是有效 JSON；请查看诊断并尝试兼容模式。'); throw error; }
+    }
+    function consume(final = false) {
+        const trimmed = buffer.trimStart();
+        if (format === 'detect') {
+            if (/^(?:data:|event:|:)/.test(trimmed)) format = 'sse';
+            else if (/^[{[]/.test(trimmed)) format = 'json';
+            else if (trimmed.startsWith('<')) throw Error('酒馆返回了 HTML 页面，而非模型响应。请检查连接或使用兼容模式。');
+            else if (final && trimmed) throw Error('模型接口返回了不支持的响应格式。');
         }
-        let text = '', lastUpdate = 0;
-        for await (const chunk of result()) {
-            controller.signal.throwIfAborted();
-            if (typeof chunk?.text === 'string') text = chunk.text;
-            if (text.length > 100000) throw Error('模型回复超过限制，请缩短预设和回复篇幅。');
-            if (Date.now() - lastUpdate > 600) {
-                progress(text ? `正在接收剧情…已收到 ${text.length.toLocaleString()} 字符` : '模型正在处理请求，请稍候…');
-                lastUpdate = Date.now();
+        if (trimmed.startsWith('<')) throw Error('酒馆返回 HTML 页面而非模型数据，请检查连接或使用兼容模式。');
+        if (packets === 0 && /^(?:data:|event:|:)/.test(trimmed)) format = 'sse';
+        // Some proxy hosts advertise SSE but return one buffered JSON response.
+        if (format === 'sse' && packets === 0 && /^[{[]/.test(trimmed)) format = 'json';
+        diagnostics.format = format;
+        if (format === 'json') {
+            let packet; try { packet = JSON.parse(buffer); } catch (error) { if (final) throw Error('模型 JSON 响应中断或不完整。'); return; }
+            accept(packet); buffer = ''; done = true;
+        } else if (format === 'sse') {
+            let match;
+            while (!done && (match = /\r\n\r\n|\n\n|\r\r/.exec(buffer))) {
+                const event = buffer.slice(0, match.index); buffer = buffer.slice(match.index + match[0].length); parseEvent(event);
+            }
+            if (final && !done && buffer.trim()) { parseEvent(buffer); buffer = ''; }
+        } else if (format === 'ndjson') {
+            let at; while (!done && (at = buffer.indexOf('\n')) >= 0) { const line = buffer.slice(0, at).trim(); buffer = buffer.slice(at + 1); if (line) accept(JSON.parse(line)); }
+            if (final && buffer.trim()) { accept(JSON.parse(buffer)); buffer = ''; }
+        }
+    }
+    try {
+        while (!done) {
+            const next = await waitRequest(reader.read(), controller, bytes ? limits.idle : limits.firstByte,
+                requestFault(bytes ? 'stream-idle' : 'no-body', bytes ? '模型数据流已停顿 30 秒；未提交部分剧情。' : '酒馆已返回响应头，但 30 秒内没有正文数据。'));
+            if (next.done) { buffer += decoder.decode(); consume(true); break; }
+            bytes += next.value.byteLength; diagnostics.bytes = bytes;
+            if (!diagnostics.firstByteMs) diagnostics.firstByteMs = Date.now() - diagnostics.started;
+            if (diagnostics.stage === 'headers') diagnostics.stage = 'body';
+            buffer += decoder.decode(next.value, { stream: true });
+            if (buffer.length > 1500000) throw Error('模型响应数据过大，已停止读取。');
+            consume();
+            if (Date.now() - lastReport > 500) {
+                report(text ? `正在接收剧情…已收到 ${text.length.toLocaleString()} 字符` : diagnostics.stage === 'thinking' ? '模型连接正常，正在思考，尚未返回剧情正文…' : `已收到 ${bytes.toLocaleString()} 字节，等待可用正文…`);
+                lastReport = Date.now();
             }
         }
+        if (!text.trim()) throw Error('接口已返回数据，但没有可用剧情正文。可查看诊断，并尝试连接测试或兼容模式。');
         return text;
-    }
-    // Older/forked Tavern hosts retain their existing adapter and provider routing.
-    // A failed request is never silently sent a second time through another path.
-    if (typeof context.generateRaw !== 'function') throw Error('当前酒馆缺少可用的生成接口，请更新酒馆。');
-    progress('酒馆正在生成剧情，请稍候…');
-    return context.generateRaw({ prompt, systemPrompt: data.systemPrompt, responseLength });
+    } finally { void reader.cancel().catch(() => {}); try { reader.releaseLock(); } catch {} }
+}
+async function generateGame(context, data, controller, progress, diagnostics = {}, task = {}, limits = REQUEST_LIMITS) {
+    const quick = data.generationMode === 'quick' || data.test === true;
+    const prompt = quick ? data.prompt : presetPrompt(context, data), service = context.ChatCompletionService;
+    const responseLength = data.test ? 256 : quick ? 1400 : data.compact ? 1800 : 2600;
+    diagnostics.started = Date.now(); diagnostics.mode = data.test ? 'probe' : quick ? 'quick' : 'full';
+    diagnostics.stage = 'prepare'; diagnostics.inputChars = data.prompt.length; diagnostics.bytes = 0; diagnostics.outputChars = 0;
+    const totalTimer = setTimeout(() => controller.abort(requestFault('total', `本次${data.test ? '连接测试' : '生成'}已达到时限；阶段：${diagnostics.stage}，收到 ${diagnostics.bytes ?? '未知'} 字节、${diagnostics.outputChars || 0} 字正文。进度未改变。`)), data.test ? limits.probeTotal : quick ? limits.quickTotal : limits.fullTotal);
+    const report = message => { diagnostics.elapsedMs = Date.now() - diagnostics.started; progress(message); };
+    try {
+        if (!data.compatibility && context.mainApi === 'openai' && typeof service?.presetToGeneratePayload === 'function' && typeof context.getChatCompletionModel === 'function') {
+            const source = Array.isArray(prompt) ? prompt : [{ role: 'user', content: prompt }];
+            const messages = [{ role: 'system', content: data.systemPrompt }, ...source].map(message => ({ ...message, content: !quick && typeof context.substituteParams === 'function' ? context.substituteParams(message.content) : message.content }));
+            const payload = await waitRequest(service.presetToGeneratePayload({}, {}, { messages, model: context.getChatCompletionModel(), stream: true, n: 1 }), controller, limits.prepare, requestFault('prepare', '酒馆准备请求超时。请检查当前预设或连接配置。'));
+            if (quick) {
+                if (payload.reasoning_effort != null && payload.reasoning_effort !== 'none') payload.reasoning_effort = 'low';
+                delete payload.tools; delete payload.tool_choice; delete payload.json_schema; delete payload.response_format;
+                payload.enable_web_search = false; payload.request_images = false;
+            }
+            const budget = Object.hasOwn(payload, 'max_completion_tokens') ? Math.max(quick ? 2048 : 4096, responseLength) : responseLength;
+            if (Object.hasOwn(payload, 'max_completion_tokens')) { payload.max_completion_tokens = budget; delete payload.max_tokens; }
+            else payload.max_tokens = quick && payload.reasoning_effort && payload.reasoning_effort !== 'none' ? Math.max(2048, budget) : budget;
+            diagnostics.maxTokens = payload.max_completion_tokens || payload.max_tokens;
+            diagnostics.api = String(context.mainApi || '').slice(0, 40);
+            diagnostics.stage = 'request';
+            if (typeof context.getRequestHeaders === 'function') {
+                diagnostics.transport = 'http-stream'; report(`请求已发出，等待酒馆 HTTP 响应（最多 ${data.test?20:45} 秒）…`);
+                const response = await waitRequest(fetch('/api/backends/chat-completions/generate', { method: 'POST', headers: context.getRequestHeaders(), cache: 'no-cache', body: JSON.stringify(payload), signal: controller.signal }), controller, data.test ? Math.min(limits.headers, 20000) : limits.headers, requestFault('no-headers', '酒馆模型请求在时限内没有返回 HTTP 响应头，尚未进入剧情解析。请运行连接测试；本次没有写入进度。'));
+                diagnostics.headersMs = Date.now() - diagnostics.started;
+                const text = await readModelResponse(response, controller, diagnostics, report, limits); diagnostics.stage = 'complete'; return text;
+            }
+            if (typeof service.sendRequest === 'function') {
+                diagnostics.transport = 'tavern-service'; delete diagnostics.bytes; report('使用酒馆请求接口，等待首个响应…');
+                const result = await waitRequest(service.sendRequest(payload, true, controller.signal), controller, limits.headers, requestFault('native-response', '酒馆原生接口在时限内没有返回响应，无法取得 HTTP 阶段信息。请运行连接测试。'));
+                if (typeof result !== 'function') return contentText(result?.content);
+                let text = '';
+                const iterator = result();
+                try { while (true) { const chunk = await waitRequest(iterator.next(), controller, limits.idle, requestFault('native-stream', '酒馆流式解析器在时限内没有返回数据。请尝试兼容模式。')); if (chunk.done) break; if (typeof chunk.value?.text === 'string') text = chunk.value.text; diagnostics.outputChars = text.length; diagnostics.stage = text ? 'text' : 'thinking'; report(text ? `正在接收剧情…已收到 ${text.length} 字符` : '模型已连接，等待正文…'); if (text.length > 100000) throw Error('模型回复过长。'); } }
+                finally { if (controller.signal.aborted) void iterator.return?.().catch?.(() => {}); }
+                return text;
+            }
+        }
+        if (typeof context.generateRaw !== 'function') throw Error('当前酒馆缺少可用的生成接口。');
+        diagnostics.transport = 'tavern-raw'; delete diagnostics.bytes; diagnostics.stage = 'native'; report('正在使用酒馆兼容接口生成短正文…');
+        task.nativeSettled = false; task.nativePromise = Promise.resolve().then(() => context.generateRaw({ prompt, systemPrompt: data.systemPrompt, responseLength }));
+        task.nativePromise.then(() => { task.nativeSettled = true; }, () => { task.nativeSettled = true; });
+        const text = await waitRequest(task.nativePromise, controller); diagnostics.outputChars = typeof text==='string'?text.length:0; diagnostics.stage = 'complete'; return text;
+    } finally { clearTimeout(totalTimer); diagnostics.elapsedMs = Date.now() - diagnostics.started; }
 }
 
 async function receive(event) {
@@ -365,37 +473,39 @@ async function receive(event) {
         if (activeGeneration?.id === data.id && activeGeneration.token === bridgeToken) activeGeneration.controller.abort();
         return;
     }
-    if (data.type !== 'wenyou:generate') return;
+    if (data.type !== 'wenyou:generate' && data.type !== 'wenyou:test') return;
     if (typeof data.id !== 'string' || typeof data.prompt !== 'string' ||
         data.prompt.length > 50000 || typeof data.systemPrompt !== 'string' ||
         data.systemPrompt.length > 5000) return;
     if (inFlight) {
-        send({ type: 'wenyou:result', id: data.id, error: '上一条生成尚未结束，请稍后再试。' });
+        send({ type: 'wenyou:result', id: data.id, error: activeGeneration?.nativePromise&&!activeGeneration.nativeSettled?'上一条生成尚未结束（旧版酒馆仍在后台运行）。请先停止酒馆生成或等待它结束，避免重复请求。':'上一条生成尚未结束，请稍后再试。' });
         return;
     }
+    if (data.type === 'wenyou:test') Object.assign(data, { test: true, generationMode: 'quick', prompt: '请仅回复：连接正常。', systemPrompt: '这是简短连接测试，只需回复一句中文，不输出思考过程。', persona: '' });
     inFlight = true;
     const requestToken = bridgeToken;
     const respond = payload => { if (requestToken === bridgeToken) send(payload); };
     const controller = new AbortController();
     activeGeneration = { id: data.id, token: requestToken, controller };
-    const deadline = setTimeout(() => controller.abort(), 240000);
+    const diagnostics = {};
+    const task = activeGeneration;
     try {
         let context = globalThis.SillyTavern?.getContext?.();
         if (!context) {
             throw Error('当前酒馆不支持 generateRaw 对象参数接口，请更新至近期官方版本。');
         }
-        context = await usePreset(context, data.preset);
-        const result = await generateGame(context, data, controller, message => respond({ type: 'wenyou:progress', id: data.id, message }));
+        context = await waitRequest(usePreset(context, data.preset), controller, REQUEST_LIMITS.prepare, requestFault('preset', '应用酒馆预设超时。请切回当前预设重试。'));
+        const result = await generateGame(context, data, controller, message => respond({ type: 'wenyou:progress', id: data.id, message, diagnostics: { ...diagnostics } }), diagnostics, task);
         if (typeof result !== 'string' || !result.trim()) {
             throw Error('模型没有返回剧情正文。请检查酒馆连接；若模型启用了长思考，可降低思考强度或换用响应更快的模型。');
         }
-        respond({ type: 'wenyou:result', id: data.id, text: result });
+        respond({ type: 'wenyou:result', id: data.id, text: data.test ? `连接成功，耗时 ${(diagnostics.elapsedMs/1000).toFixed(1)} 秒。` : result, diagnostics: { ...diagnostics } });
     } catch (error) {
-        respond({ type: 'wenyou:result', id: data.id, ...generationError(error) });
+        respond({ type: 'wenyou:result', id: data.id, ...generationError(error), diagnostics: { ...diagnostics, failure: error.kind || error.name || 'error' } });
     } finally {
-        clearTimeout(deadline);
-        activeGeneration = null;
-        inFlight = false;
+        const release = () => { if (activeGeneration === task) { activeGeneration = null; inFlight = false; } };
+        if (task.nativePromise && !task.nativeSettled) task.nativePromise.then(release, release);
+        else release();
     }
 }
 
